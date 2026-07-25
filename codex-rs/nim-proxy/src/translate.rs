@@ -39,34 +39,36 @@ fn gen_id(prefix: &str) -> String {
 // ============================================================================
 // Request translation: Responses → Chat Completions
 //
-// This is a TRUE TRANSPARENT BRIDGE — we don't inject any "max effort"
-// params by default. Whatever codex sends, we translate to Chat Completions
-// and forward. The only thing we override is the model name (replaced with
-// `backend_model`), so codex's UI shows whatever it picked (e.g.
-// "gpt-5.6-sol") but the actual backend is always the configured NIM model.
-//
-// If `enable_thinking` is true, we inject the reasoning params. OFF by
-// default because it makes non-reasoning models super slow.
+// TRUE INVISIBLE BRIDGE:
+//   - Codex sends `model: "gpt-5.6-sol"` → we silently replace with
+//     `backend_model` (e.g. "thinkingmachines/inkling") before forwarding
+//   - Response events come back with `model: "gpt-5.6-sol"` (the original)
+//     so codex's UI has NO idea a proxy is in the middle
+//   - No params injected by default (transparent passthrough)
+//   - All codex-specific fields (store, include, service_tier, etc.) are
+//     stripped — NIM doesn't understand them and would 400
+//   - Image inputs translated from Responses format to OpenAI Chat format
 // ============================================================================
 
 pub fn translate_request(
     responses_body: &Value,
     backend_model: &str,
     enable_thinking: bool,
-) -> Result<Value> {
+) -> Result<(Value, String)> {
     let obj = responses_body
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("responses request body must be a JSON object"))?;
 
-    // NOTE: We intentionally ignore the `model` field from codex (e.g.
-    // "gpt-5.6-sol") and replace it with the configured backend NIM model.
-    // This is the core "override bridge" behavior — codex's UI shows its
-    // own model name, but every request actually hits `backend_model`.
-    let _incoming_model = obj
+    // Capture the incoming model name (what codex thinks it's using). We
+    // return this so the response stream can use it in response events —
+    // this is what makes the bridge INVISIBLE: codex sends "gpt-5.6-sol",
+    // response events say "gpt-5.6-sol", but the actual NIM call used
+    // `backend_model`.
+    let incoming_model = obj
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let model = backend_model.to_string();
+        .unwrap_or("unknown")
+        .to_string();
 
     let instructions = obj
         .get("instructions")
@@ -78,7 +80,8 @@ pub fn translate_request(
     let messages = build_chat_messages(&instructions, &input)?;
 
     let mut chat_body = Map::new();
-    chat_body.insert("model".to_string(), Value::String(model));
+    // Override model with backend_model — this is the core bridge behavior.
+    chat_body.insert("model".to_string(), Value::String(backend_model.to_string()));
     chat_body.insert("messages".to_string(), Value::Array(messages));
     chat_body.insert("stream".to_string(), Value::Bool(true));
 
@@ -113,19 +116,23 @@ pub fn translate_request(
         chat_body.insert("parallel_tool_calls".to_string(), p.clone());
     }
 
-    // Pass through any temperature/top_p/max_tokens codex sent — we don't
-    // override them. This keeps the bridge truly transparent.
-    for field in ["temperature", "top_p", "max_tokens", "max_output_tokens", "stop", "user"] {
+    // Pass through sampling params codex sent (if any). We do NOT inject
+    // defaults — transparent passthrough.
+    for field in ["temperature", "top_p", "stop", "user"] {
         if let Some(v) = obj.get(field) {
-            // max_output_tokens is Responses-API; NIM wants max_tokens.
-            let key = if field == "max_output_tokens" { "max_tokens" } else { field };
-            chat_body.insert(key.to_string(), v.clone());
+            chat_body.insert(field.to_string(), v.clone());
         }
     }
+    // max_output_tokens (Responses API) → max_tokens (Chat Completions)
+    if let Some(v) = obj.get("max_output_tokens") {
+        chat_body.insert("max_tokens".to_string(), v.clone());
+    } else if let Some(v) = obj.get("max_tokens") {
+        chat_body.insert("max_tokens".to_string(), v.clone());
+    }
 
-    // Only inject thinking params when explicitly enabled. These are what
-    // unlock `reasoning_content` on Nemotron / DeepSeek-R1 / Mistral-Nemotron,
-    // but they make non-reasoning models like Qwen3 super slow if sent.
+    // Only inject thinking params when explicitly enabled. These unlock
+    // `reasoning_content` on Nemotron / DeepSeek-R1 / Mistral-Nemotron /
+    // Inkling, but they make non-reasoning models super slow if sent.
     if enable_thinking {
         let mut ctk = Map::new();
         ctk.insert("enable_thinking".to_string(), Value::Bool(true));
@@ -136,7 +143,13 @@ pub fn translate_request(
         );
     }
 
-    Ok(Value::Object(chat_body))
+    // NOTE: We intentionally DO NOT forward these codex-specific fields
+    // because NIM rejects unknown fields with 400:
+    //   - store, stream_options, include, service_tier, prompt_cache_key
+    //   - text, client_metadata, previous_response_id, reasoning
+    // Codex doesn't need them to be honored — they're optimizations.
+
+    Ok((Value::Object(chat_body), incoming_model))
 }
 
 fn translate_tool_definition(tool: &Value) -> Option<Value> {
@@ -224,7 +237,7 @@ fn build_chat_messages(instructions: &str, input: &Value) -> Result<Vec<Value>> 
                     .and_then(Value::as_str)
                     .unwrap_or("user")
                     .to_string();
-                let content = message_content_to_string(obj.get("content"));
+                let content = build_chat_content(obj.get("content"));
                 messages.push(serde_json::json!({ "role": role, "content": content }));
             }
             "function_call" => {
@@ -290,28 +303,68 @@ fn build_chat_messages(instructions: &str, input: &Value) -> Result<Vec<Value>> 
     Ok(messages)
 }
 
-fn message_content_to_string(content: Option<&Value>) -> String {
+/// Build the `content` field for a Chat Completions message.
+///
+/// Returns either:
+///   - A plain string (if the message is text-only) — most efficient
+///   - An array of content parts (if the message has images) — OpenAI format
+///
+/// Translates Responses-API content types to Chat Completions:
+///   - `input_text` / `output_text` / `text` → `{"type":"text","text":...}`
+///   - `input_image` → `{"type":"image_url","image_url":{"url":...}}`
+///   - `input_audio` → dropped (NIM doesn't support audio in chat completions)
+fn build_chat_content(content: Option<&Value>) -> Value {
     let Some(content) = content else {
-        return String::new();
+        return Value::String(String::new());
     };
     match content {
-        Value::String(s) => s.clone(),
+        Value::String(s) => Value::String(s.clone()),
         Value::Array(arr) => {
-            let mut parts: Vec<String> = Vec::new();
+            let mut parts: Vec<Value> = Vec::new();
+            let mut text_only = true;
             for part in arr {
                 let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
                 match kind {
                     "input_text" | "output_text" | "text" => {
                         if let Some(t) = part.get("text").and_then(Value::as_str) {
-                            parts.push(t.to_string());
+                            parts.push(serde_json::json!({"type": "text", "text": t}));
+                        }
+                    }
+                    "input_image" => {
+                        text_only = false;
+                        if let Some(url) = part.get("image_url").and_then(Value::as_str) {
+                            parts.push(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": {"url": url}
+                            }));
                         }
                     }
                     _ => {}
                 }
             }
-            parts.join("\n")
+            // If text-only, return a plain string (more efficient + compatible)
+            if text_only {
+                let s: String = parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str).map(String::from))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Value::String(s)
+            } else {
+                Value::Array(parts)
+            }
         }
-        _ => content.to_string(),
+        _ => Value::String(content.to_string()),
+    }
+}
+
+/// Legacy helper — kept for backwards compat. Use `build_chat_content` for
+/// new code since it handles images.
+#[allow(dead_code)]
+fn message_content_to_string(content: Option<&Value>) -> String {
+    match build_chat_content(content) {
+        Value::String(s) => s,
+        other => other.to_string(),
     }
 }
 
@@ -791,12 +844,16 @@ pub struct ChatUsage {
 
 pub fn spawn_stream_converter(
     upstream_stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
-    model: String,
+    // The model name to use in response events. This should be the
+    // INCOMING model (what codex sent), NOT the backend model — so codex's
+    // UI sees the "expected" model name and can't tell a proxy is in the
+    // middle.
+    response_model: String,
 ) -> mpsc::Receiver<Result<bytes::Bytes, std::io::Error>> {
     let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
 
     tokio::spawn(async move {
-        let mut state = ChatToResponsesStream::new(model.clone());
+        let mut state = ChatToResponsesStream::new(response_model.clone());
         let mut line_buf = String::new();
         let mut stream = upstream_stream.boxed();
 
@@ -884,7 +941,7 @@ mod tests {
             "tool_choice": "auto",
             "parallel_tool_calls": false
         });
-        let chat = translate_request(&body, "qwen/qwen3-next-80b-a3b-instruct", false).unwrap();
+        let (chat, incoming) = translate_request(&body, "qwen/qwen3-next-80b-a3b-instruct", false).unwrap();
         let messages = chat.get("messages").unwrap().as_array().unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
@@ -894,6 +951,9 @@ mod tests {
         // CRITICAL: model name is OVERRIDDEN with backend model, not what codex sent.
         assert_eq!(chat["model"], "qwen/qwen3-next-80b-a3b-instruct");
         assert_ne!(chat["model"], "gpt-5.6-sol");
+        // But we return the incoming model name so response events can use it
+        // (this is what makes the bridge INVISIBLE).
+        assert_eq!(incoming, "gpt-5.6-sol");
         assert_eq!(chat["stream"], true);
         assert_eq!(chat["tool_choice"], "auto");
     }
@@ -910,7 +970,7 @@ mod tests {
                 {"type": "function_call_output", "call_id": "call_1", "output": "file.txt"}
             ]
         });
-        let chat = translate_request(&body, "qwen/qwen3", false).unwrap();
+        let (chat, _) = translate_request(&body, "qwen/qwen3", false).unwrap();
         let messages = chat.get("messages").unwrap().as_array().unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["role"], "user");
@@ -935,7 +995,7 @@ mod tests {
                 {"type": "function", "name": "shell", "parameters": {"type": "object"}, "description": "Run a shell command"}
             ]
         });
-        let chat = translate_request(&body, "qwen/qwen3", false).unwrap();
+        let (chat, _) = translate_request(&body, "qwen/qwen3", false).unwrap();
         let tools = chat.get("tools").unwrap().as_array().unwrap();
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "shell");
@@ -948,7 +1008,7 @@ mod tests {
             "model": "x",
             "input": "hello world"
         });
-        let chat = translate_request(&body, "qwen/qwen3", false).unwrap();
+        let (chat, _) = translate_request(&body, "qwen/qwen3", false).unwrap();
         let messages = chat.get("messages").unwrap().as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
@@ -958,7 +1018,7 @@ mod tests {
     #[test]
     fn enable_thinking_injects_reasoning_params() {
         let body = serde_json::json!({"model": "x", "input": "hi"});
-        let chat = translate_request(&body, "nemotron", true).unwrap();
+        let (chat, _) = translate_request(&body, "nemotron", true).unwrap();
         assert_eq!(chat["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(chat["reasoning_budget"], 99_999_999);
     }
@@ -966,11 +1026,80 @@ mod tests {
     #[test]
     fn enable_thinking_off_by_default_omits_reasoning_params() {
         let body = serde_json::json!({"model": "x", "input": "hi"});
-        let chat = translate_request(&body, "qwen", false).unwrap();
+        let (chat, _) = translate_request(&body, "qwen", false).unwrap();
         // Qwen3 should NOT have thinking params injected by default — this
         // was the cause of the "1m 59s for hi" slowness.
         assert!(chat.get("chat_template_kwargs").is_none());
         assert!(chat.get("reasoning_budget").is_none());
+    }
+
+    #[test]
+    fn strips_codex_specific_fields() {
+        let body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": "hi",
+            "store": true,
+            "include": ["reasoning.encrypted_content"],
+            "service_tier": "priority",
+            "prompt_cache_key": "abc123",
+            "text": {"format": {"type": "text"}},
+            "client_metadata": {"turn_id": "xyz"},
+            "reasoning": {"effort": "high"}
+        });
+        let (chat, _) = translate_request(&body, "qwen", false).unwrap();
+        // None of these codex-specific fields should appear in the chat body
+        // (NIM would reject them with 400).
+        assert!(chat.get("store").is_none());
+        assert!(chat.get("include").is_none());
+        assert!(chat.get("service_tier").is_none());
+        assert!(chat.get("prompt_cache_key").is_none());
+        assert!(chat.get("text").is_none());
+        assert!(chat.get("client_metadata").is_none());
+        assert!(chat.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn translates_image_input() {
+        let body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "What's in this image?"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,iVBOR..."}
+                ]
+            }]
+        });
+        let (chat, _) = translate_request(&body, "qwen/qwen2.5-vl", false).unwrap();
+        let messages = chat.get("messages").unwrap().as_array().unwrap();
+        // Content should be an array (because it has an image), not a plain string.
+        assert!(messages[0]["content"].is_array());
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert!(content[1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png"));
+    }
+
+    #[test]
+    fn text_only_content_returns_plain_string() {
+        let body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "hello"},
+                    {"type": "input_text", "text": "world"}
+                ]
+            }]
+        });
+        let (chat, _) = translate_request(&body, "qwen", false).unwrap();
+        let messages = chat.get("messages").unwrap().as_array().unwrap();
+        // Text-only content should be a plain string (joined), not an array.
+        assert!(messages[0]["content"].is_string());
+        assert_eq!(messages[0]["content"], "hello\nworld");
     }
 
     #[test]

@@ -168,12 +168,12 @@ async fn handle_responses(
         info!("responses request body: {responses_body}");
     }
 
-    let chat_body = match translate_request(
+    let (chat_body, response_model) = match translate_request(
         &responses_body,
         &state.cfg.backend_model,
         state.cfg.enable_thinking,
     ) {
-        Ok(b) => b,
+        Ok((b, m)) => (b, m),
         Err(e) => {
             return error_response(StatusCode::BAD_REQUEST, &format!("translation error: {e}"));
         }
@@ -183,8 +183,11 @@ async fn handle_responses(
         info!("translated chat request body: {chat_body}");
     }
 
-    // Use the backend model for any downstream logging / error reporting.
-    let model = state.cfg.backend_model.clone();
+    // `response_model` is the INCOMING model name (what codex sent, e.g.
+    // "gpt-5.6-sol"). We use this in response events so codex's UI sees
+    // the "expected" model name and can't tell a proxy is in the middle.
+    // This is the KEY to the invisible bridge.
+    let model = response_model;
 
     let chat_url = state.cfg.upstream_chat_url();
     let req = state

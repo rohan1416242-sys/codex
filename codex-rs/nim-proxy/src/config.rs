@@ -16,7 +16,7 @@ pub const DEFAULT_PROXY_PORT: u16 = 8765;
 /// regardless of what codex thinks it's using. Codex's UI will show
 /// whatever model codex picked (e.g. "gpt-5.6-sol"), but every request
 /// actually hits this NIM model on the upstream.
-pub const DEFAULT_BACKEND_MODEL: &str = "qwen/qwen3-next-80b-a3b-instruct";
+pub const DEFAULT_BACKEND_MODEL: &str = "thinkingmachines/inkling";
 
 /// Environment variable that holds the NIM API key.
 pub const NIM_API_KEY_ENV: &str = "NVIDIA_API_KEY";
