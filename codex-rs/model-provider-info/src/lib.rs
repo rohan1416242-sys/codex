@@ -51,6 +51,21 @@ const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer su
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
 
+/// NVIDIA NIM provider constants. NIM only exposes `/v1/chat/completions`
+/// upstream, so this provider points at a local translator proxy
+/// (`codex-nim-proxy`) that exposes a Responses-API endpoint on localhost
+/// and translates to/from Chat Completions for the upstream NIM server.
+pub const NVIDIA_NIM_PROVIDER_NAME: &str = "NVIDIA NIM";
+pub const NVIDIA_NIM_PROVIDER_ID: &str = "nvidia-nim";
+/// Default local port the `codex-nim-proxy` binary listens on.
+pub const DEFAULT_NIM_PROXY_PORT: u16 = 8765;
+/// Environment variable that holds the NIM API key. Read by the proxy.
+pub const NIM_API_KEY_ENV: &str = "NVIDIA_API_KEY";
+const NIM_API_KEY_INSTRUCTIONS: &str =
+    "Get a key at https://developer.nvidia.com (Build → NVIDIA NIM). Set the \
+     `NVIDIA_API_KEY` environment variable to your `nvapi-...` key, then run \
+     `codex-nim-proxy` in the background.";
+
 /// Wire protocol that the provider speaks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -401,6 +416,39 @@ impl ModelProviderInfo {
         }
     }
 
+    /// Construct the built-in NVIDIA NIM provider definition.
+    ///
+    /// NIM upstream only speaks Chat Completions, so this provider points at
+    /// the local `codex-nim-proxy` translator by default.
+    pub fn create_nvidia_nim_provider() -> ModelProviderInfo {
+        let default_port = std::env::var("CODEX_NIM_PROXY_PORT")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(DEFAULT_NIM_PROXY_PORT);
+        let base_url = format!("http://localhost:{default_port}/v1");
+        ModelProviderInfo {
+            name: NVIDIA_NIM_PROVIDER_NAME.into(),
+            base_url: Some(base_url),
+            env_key: Some(NIM_API_KEY_ENV.into()),
+            env_key_instructions: Some(NIM_API_KEY_INSTRUCTIONS.into()),
+            experimental_bearer_token: None,
+            auth: None,
+            aws: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+            supports_standalone_web_search: false,
+        }
+    }
+
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
     }
@@ -441,14 +489,17 @@ pub fn built_in_model_providers(
     use ModelProviderInfo as P;
     let openai_provider = P::create_openai_provider(openai_base_url);
     let amazon_bedrock_provider = P::create_amazon_bedrock_provider(/*aws*/ None);
+    let nvidia_nim_provider = P::create_nvidia_nim_provider();
 
     // We do not want to be in the business of adjucating which third-party
     // providers are bundled with Codex CLI, so we only include the OpenAI and
-    // open source ("oss") providers by default. Users are encouraged to add to
-    // `model_providers` in config.toml to add their own providers.
+    // open source ("oss") providers by default. NVIDIA NIM is included because
+    // it ships with its own translator proxy (`codex-nim-proxy`) and the
+    // integration is fully open-source.
     [
         (OPENAI_PROVIDER_ID, openai_provider),
         (AMAZON_BEDROCK_PROVIDER_ID, amazon_bedrock_provider),
+        (NVIDIA_NIM_PROVIDER_ID, nvidia_nim_provider),
         (
             OLLAMA_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
