@@ -72,9 +72,10 @@ pub async fn serve(cfg: ProxyConfig) -> Result<()> {
 
     info!("codex-nim-proxy listening on http://{bind_addr}");
     info!("forwarding to upstream {}", cfg.upstream_base_url);
+    info!("backend model: {} (ALL codex requests rerouted here)", cfg.backend_model);
     info!(
-        "model picker: {} models curated",
-        crate::catalog::CURATED_MODELS.len()
+        "enable_thinking: {} (only affects nemotron / deepseek-r1 / mistral-nemotron)",
+        cfg.enable_thinking
     );
     if cfg.rpm > 0 {
         info!("rate limit: {} requests per minute (NIM free tier cap)", cfg.rpm);
@@ -142,7 +143,7 @@ async fn handle_responses(
         }
     };
 
-    let model = responses_body
+    let incoming_model = responses_body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("unknown")
@@ -153,15 +154,25 @@ async fn handle_responses(
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
+    // Log the model override: codex sent `incoming_model`, we'll forward
+    // to NIM using `state.cfg.backend_model`.
+    info!(
+        "model override: codex=`{incoming_model}` → backend=`{}`",
+        state.cfg.backend_model
+    );
     debug!(
-        "responses request: model={model} stream={want_stream} body_bytes={}",
+        "responses request: stream={want_stream} body_bytes={}",
         body.len()
     );
     if state.cfg.verbose {
         info!("responses request body: {responses_body}");
     }
 
-    let chat_body = match translate_request(&responses_body) {
+    let chat_body = match translate_request(
+        &responses_body,
+        &state.cfg.backend_model,
+        state.cfg.enable_thinking,
+    ) {
         Ok(b) => b,
         Err(e) => {
             return error_response(StatusCode::BAD_REQUEST, &format!("translation error: {e}"));
@@ -171,6 +182,9 @@ async fn handle_responses(
     if state.cfg.verbose {
         info!("translated chat request body: {chat_body}");
     }
+
+    // Use the backend model for any downstream logging / error reporting.
+    let model = state.cfg.backend_model.clone();
 
     let chat_url = state.cfg.upstream_chat_url();
     let req = state

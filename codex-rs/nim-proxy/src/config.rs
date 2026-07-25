@@ -12,6 +12,12 @@ pub const DEFAULT_UPSTREAM_BASE_URL: &str = "https://integrate.api.nvidia.com/v1
 /// Default local port for the proxy.
 pub const DEFAULT_PROXY_PORT: u16 = 8765;
 
+/// Default NIM model that ALL codex requests are silently routed to,
+/// regardless of what codex thinks it's using. Codex's UI will show
+/// whatever model codex picked (e.g. "gpt-5.6-sol"), but every request
+/// actually hits this NIM model on the upstream.
+pub const DEFAULT_BACKEND_MODEL: &str = "qwen/qwen3-next-80b-a3b-instruct";
+
 /// Environment variable that holds the NIM API key.
 pub const NIM_API_KEY_ENV: &str = "NVIDIA_API_KEY";
 
@@ -25,6 +31,17 @@ pub struct ProxyConfig {
     /// Max requests per minute to send to the upstream. NIM free tier = 40.
     /// Set to 0 to disable rate limiting.
     pub rpm: u32,
+    /// The NIM model slug that ALL incoming requests are silently rerouted
+    /// to. Whatever codex sends as `model` (e.g. "gpt-5.6-sol") is replaced
+    /// with this value before forwarding to NIM. This is the core "override
+    /// bridge" behavior: codex's UI keeps showing its own model name, but
+    /// the actual backend is always this NIM model.
+    pub backend_model: String,
+    /// When true, inject `chat_template_kwargs.enable_thinking = true` and
+    /// `reasoning_budget = 99_999_999` for reasoning-capable NIM models
+    /// (nemotron, deepseek-r1, mistral-nemotron). OFF by default because
+    /// it makes non-reasoning models slow.
+    pub enable_thinking: bool,
 }
 
 impl ProxyConfig {
@@ -34,6 +51,8 @@ impl ProxyConfig {
         api_key_override: Option<String>,
         verbose: bool,
         rpm: u32,
+        backend_model: Option<String>,
+        enable_thinking: bool,
     ) -> Result<Self> {
         let bind_addr: SocketAddr = ([127, 0, 0, 1], port).into();
 
@@ -53,6 +72,9 @@ impl ProxyConfig {
             },
         };
 
+        let backend_model = backend_model
+            .unwrap_or_else(|| DEFAULT_BACKEND_MODEL.to_string());
+
         Ok(Self {
             bind_addr,
             upstream_base_url,
@@ -60,6 +82,8 @@ impl ProxyConfig {
             request_timeout_secs: 600,
             verbose,
             rpm,
+            backend_model,
+            enable_thinking,
         })
     }
 
@@ -85,6 +109,8 @@ mod tests {
             request_timeout_secs: 1,
             verbose: false,
             rpm: 40,
+            backend_model: "qwen/qwen3".to_string(),
+            enable_thinking: false,
         };
         assert_eq!(cfg.upstream_chat_url(), "https://example.com/v1/chat/completions");
         assert_eq!(cfg.upstream_models_url(), "https://example.com/v1/models");
@@ -98,8 +124,11 @@ mod tests {
             Some("k".to_string()),
             false,
             40,
+            None,
+            false,
         )
         .expect("resolve");
         assert_eq!(r.upstream_base_url, "https://example.com/v1");
+        assert_eq!(r.backend_model, DEFAULT_BACKEND_MODEL);
     }
 }

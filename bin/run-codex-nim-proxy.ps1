@@ -2,6 +2,8 @@
 param(
     [int]$Port = 8765,
     [int]$Rpm = 40,
+    [string]$BackendModel = "qwen/qwen3-next-80b-a3b-instruct",
+    [switch]$EnableThinking,
     [string]$UpstreamBaseUrl,
     [string]$ApiKey,
     [switch]$Verbose
@@ -21,7 +23,8 @@ if (-not $apiKeyPresent) {
     Write-Warning "NVIDIA_API_KEY is not set. Get one at https://developer.nvidia.com -> Build -> NVIDIA NIM"
 }
 
-$args = @("--port", $Port, "--rpm", $Rpm)
+$args = @("--port", $Port, "--rpm", $Rpm, "--backend-model", $BackendModel)
+if ($EnableThinking)  { $args += "--enable-thinking" }
 if ($UpstreamBaseUrl) { $args += @("--upstream-base-url", $UpstreamBaseUrl) }
 if ($ApiKey)          { $args += @("--api-key", $ApiKey) }
 if ($Verbose)         { $args += "--verbose" }

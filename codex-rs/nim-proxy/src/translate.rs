@@ -37,19 +37,36 @@ fn gen_id(prefix: &str) -> String {
 }
 
 // ============================================================================
-// Request translation: Responses → Chat Completions  (MAX-EFFORT NIM PARAMS)
+// Request translation: Responses → Chat Completions
+//
+// This is a TRUE TRANSPARENT BRIDGE — we don't inject any "max effort"
+// params by default. Whatever codex sends, we translate to Chat Completions
+// and forward. The only thing we override is the model name (replaced with
+// `backend_model`), so codex's UI shows whatever it picked (e.g.
+// "gpt-5.6-sol") but the actual backend is always the configured NIM model.
+//
+// If `enable_thinking` is true, we inject the reasoning params. OFF by
+// default because it makes non-reasoning models super slow.
 // ============================================================================
 
-pub fn translate_request(responses_body: &Value) -> Result<Value> {
+pub fn translate_request(
+    responses_body: &Value,
+    backend_model: &str,
+    enable_thinking: bool,
+) -> Result<Value> {
     let obj = responses_body
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("responses request body must be a JSON object"))?;
 
-    let model = obj
+    // NOTE: We intentionally ignore the `model` field from codex (e.g.
+    // "gpt-5.6-sol") and replace it with the configured backend NIM model.
+    // This is the core "override bridge" behavior — codex's UI shows its
+    // own model name, but every request actually hits `backend_model`.
+    let _incoming_model = obj
         .get("model")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("missing `model` field"))?
-        .to_string();
+        .unwrap_or("unknown");
+    let model = backend_model.to_string();
 
     let instructions = obj
         .get("instructions")
@@ -96,50 +113,27 @@ pub fn translate_request(responses_body: &Value) -> Result<Value> {
         chat_body.insert("parallel_tool_calls".to_string(), p.clone());
     }
 
-    // ─── MAX-EFFORT NIM PARAMS ────────────────────────────────────────────
-    // Verified live against integrate.api.nvidia.com:
-    //   temperature   = 1   (max — let the model sample freely)
-    //   top_p         = 1   (max — no nucleus truncation)
-    //   max_tokens    = OMITTED — let NIM use each model's actual max.
-    //                    (Sending 99999999 fails with 400 on Qwen3 because
-    //                     its max_model_len is 262144. NIM clamps internally
-    //                     when we don't send it, so omission = true max.)
-    //   chat_template_kwargs.enable_thinking = true
-    //                              (unlocks reasoning_content on nemotron)
-    //   reasoning_budget = 99_999_999
-    //                              (max reasoning tokens; NIM clamps this
-    //                               one internally — verified working)
-    // `extra_body` is REJECTED by NIM (400). Must be top-level fields.
-
-    chat_body.insert(
-        "temperature".to_string(),
-        serde_json::Number::from_f64(1.0)
-            .map(Value::Number)
-            .unwrap_or(Value::Number(serde_json::Number::from(1))),
-    );
-    chat_body.insert(
-        "top_p".to_string(),
-        serde_json::Number::from_f64(1.0)
-            .map(Value::Number)
-            .unwrap_or(Value::Number(serde_json::Number::from(1))),
-    );
-    // NOTE: max_tokens intentionally omitted. NIM will use the model's
-    // max_model_len as the cap, which is the true "max" for each model.
-    // (Sending an explicit large value like 99999999 fails because NIM
-    // validates it against the model's context window.)
-    let mut ctk = Map::new();
-    ctk.insert("enable_thinking".to_string(), Value::Bool(true));
-    chat_body.insert("chat_template_kwargs".to_string(), Value::Object(ctk));
-    chat_body.insert(
-        "reasoning_budget".to_string(),
-        Value::Number(serde_json::Number::from(99_999_999)),
-    );
-
-    if let Some(s) = obj.get("stop") {
-        chat_body.insert("stop".to_string(), s.clone());
+    // Pass through any temperature/top_p/max_tokens codex sent — we don't
+    // override them. This keeps the bridge truly transparent.
+    for field in ["temperature", "top_p", "max_tokens", "max_output_tokens", "stop", "user"] {
+        if let Some(v) = obj.get(field) {
+            // max_output_tokens is Responses-API; NIM wants max_tokens.
+            let key = if field == "max_output_tokens" { "max_tokens" } else { field };
+            chat_body.insert(key.to_string(), v.clone());
+        }
     }
-    if let Some(u) = obj.get("user") {
-        chat_body.insert("user".to_string(), u.clone());
+
+    // Only inject thinking params when explicitly enabled. These are what
+    // unlock `reasoning_content` on Nemotron / DeepSeek-R1 / Mistral-Nemotron,
+    // but they make non-reasoning models like Qwen3 super slow if sent.
+    if enable_thinking {
+        let mut ctk = Map::new();
+        ctk.insert("enable_thinking".to_string(), Value::Bool(true));
+        chat_body.insert("chat_template_kwargs".to_string(), Value::Object(ctk));
+        chat_body.insert(
+            "reasoning_budget".to_string(),
+            Value::Number(serde_json::Number::from(99_999_999)),
+        );
     }
 
     Ok(Value::Object(chat_body))
@@ -880,7 +874,7 @@ mod tests {
     #[test]
     fn translates_basic_request() {
         let body = serde_json::json!({
-            "model": "qwen/qwen3-next-80b-a3b-instruct",
+            "model": "gpt-5.6-sol",
             "instructions": "Be helpful.",
             "input": [
                 {"type": "message", "role": "user", "content": [
@@ -890,14 +884,16 @@ mod tests {
             "tool_choice": "auto",
             "parallel_tool_calls": false
         });
-        let chat = translate_request(&body).unwrap();
+        let chat = translate_request(&body, "qwen/qwen3-next-80b-a3b-instruct", false).unwrap();
         let messages = chat.get("messages").unwrap().as_array().unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "Be helpful.");
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[1]["content"], "hello");
+        // CRITICAL: model name is OVERRIDDEN with backend model, not what codex sent.
         assert_eq!(chat["model"], "qwen/qwen3-next-80b-a3b-instruct");
+        assert_ne!(chat["model"], "gpt-5.6-sol");
         assert_eq!(chat["stream"], true);
         assert_eq!(chat["tool_choice"], "auto");
     }
@@ -914,7 +910,7 @@ mod tests {
                 {"type": "function_call_output", "call_id": "call_1", "output": "file.txt"}
             ]
         });
-        let chat = translate_request(&body).unwrap();
+        let chat = translate_request(&body, "qwen/qwen3", false).unwrap();
         let messages = chat.get("messages").unwrap().as_array().unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["role"], "user");
@@ -939,7 +935,7 @@ mod tests {
                 {"type": "function", "name": "shell", "parameters": {"type": "object"}, "description": "Run a shell command"}
             ]
         });
-        let chat = translate_request(&body).unwrap();
+        let chat = translate_request(&body, "qwen/qwen3", false).unwrap();
         let tools = chat.get("tools").unwrap().as_array().unwrap();
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "shell");
@@ -952,11 +948,29 @@ mod tests {
             "model": "x",
             "input": "hello world"
         });
-        let chat = translate_request(&body).unwrap();
+        let chat = translate_request(&body, "qwen/qwen3", false).unwrap();
         let messages = chat.get("messages").unwrap().as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"], "hello world");
+    }
+
+    #[test]
+    fn enable_thinking_injects_reasoning_params() {
+        let body = serde_json::json!({"model": "x", "input": "hi"});
+        let chat = translate_request(&body, "nemotron", true).unwrap();
+        assert_eq!(chat["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(chat["reasoning_budget"], 99_999_999);
+    }
+
+    #[test]
+    fn enable_thinking_off_by_default_omits_reasoning_params() {
+        let body = serde_json::json!({"model": "x", "input": "hi"});
+        let chat = translate_request(&body, "qwen", false).unwrap();
+        // Qwen3 should NOT have thinking params injected by default — this
+        // was the cause of the "1m 59s for hi" slowness.
+        assert!(chat.get("chat_template_kwargs").is_none());
+        assert!(chat.get("reasoning_budget").is_none());
     }
 
     #[test]

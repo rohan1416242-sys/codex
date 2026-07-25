@@ -2,6 +2,7 @@
 
 use clap::Parser;
 use codex_nim_proxy::ProxyConfig;
+use codex_nim_proxy::config::DEFAULT_BACKEND_MODEL;
 use codex_nim_proxy::config::DEFAULT_PROXY_PORT;
 use codex_nim_proxy::rate_limit::DEFAULT_RPM;
 use codex_nim_proxy::serve;
@@ -10,7 +11,7 @@ use codex_nim_proxy::serve;
 #[command(
     name = "codex-nim-proxy",
     version,
-    about = "Local Responses→Chat translator for NVIDIA NIM"
+    about = "Transparent override bridge: codex CLI → NVIDIA NIM (any model)"
 )]
 pub struct Args {
     /// Port to listen on. Defaults to 8765.
@@ -24,6 +25,20 @@ pub struct Args {
     /// NVIDIA API key. If omitted, read from the `NVIDIA_API_KEY` env var.
     #[arg(long)]
     api_key: Option<String>,
+
+    /// The NIM model slug that ALL codex requests are silently rerouted to.
+    /// Codex's UI will show whatever model codex picked (e.g. "gpt-5.6-sol"),
+    /// but the actual backend is always this NIM model.
+    /// Default: qwen/qwen3-next-80b-a3b-instruct (fast + great coder).
+    #[arg(long, default_value = DEFAULT_BACKEND_MODEL)]
+    backend_model: String,
+
+    /// Inject `chat_template_kwargs.enable_thinking = true` and
+    /// `reasoning_budget = 99999999` for reasoning-capable NIM models
+    /// (nemotron, deepseek-r1, mistral-nemotron). OFF by default because
+    /// it makes non-reasoning models super slow.
+    #[arg(long, default_value_t = false)]
+    enable_thinking: bool,
 
     /// Max requests per minute to send to the upstream.
     /// NIM free tier = 40. Set to 0 to disable rate limiting.
@@ -58,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
         args.api_key,
         args.verbose,
         args.rpm,
+        Some(args.backend_model),
+        args.enable_thinking,
     )?;
 
     serve(cfg).await
