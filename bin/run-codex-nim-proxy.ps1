@@ -2,7 +2,7 @@
 param(
     [int]$Port = 8765,
     [int]$Rpm = 40,
-    [string]$BackendModel = "qwen/qwen3-next-80b-a3b-instruct",
+    [string]$BackendModel = "thinkingmachines/inkling",
     [switch]$EnableThinking,
     [string]$UpstreamBaseUrl,
     [string]$ApiKey,

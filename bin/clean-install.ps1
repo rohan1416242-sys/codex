@@ -15,7 +15,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  codex-nim-proxy — Clean Install" -ForegroundColor Cyan
+Write-Host "  codex-nim-proxy - Clean Install" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -60,26 +60,28 @@ Remove-Item "$codexDir\auth.json" -Force -ErrorAction SilentlyContinue
 Remove-Item "$codexDir\config.toml" -Force -ErrorAction SilentlyContinue
 Remove-Item "$codexDir\config.lock.json" -Force -ErrorAction SilentlyContinue
 Remove-Item "$codexDir\history.jsonl" -Force -ErrorAction SilentlyContinue
-# Keep sessions/skills/memories — those are user data
 Write-Host "  Deleted auth.json, config.toml, config.lock.json, history.jsonl" -ForegroundColor Green
 
-# Step 5: Write fresh config.toml — TRUE INVISIBLE BRIDGE config
+# Step 5: Write fresh config.toml - INVISIBLE BRIDGE config
 Write-Host "[5/7] Writing fresh config.toml (invisible bridge)..." -ForegroundColor Yellow
-$config = @"
-# All codex requests are silently routed to the local proxy, which forwards
-# to NVIDIA NIM using the configured backend model. Codex's UI shows whatever
-# model it picks (e.g. gpt-5.6-sol) — the proxy overrides it invisibly.
-model_provider = "nvidia-nim"
-
-[model_providers.nvidia-nim]
-name = "NVIDIA NIM"
-base_url = "http://localhost:8765/v1"
-env_key = "NVIDIA_API_KEY"
-wire_api = "responses"
-requires_openai_auth = false
-supports_websockets = false
-"@
-$config | Out-File -FilePath "$codexDir\config.toml" -Encoding utf8 -NoNewline
+$configLines = @(
+    '# codex-nim-proxy invisible bridge config',
+    '# All requests silently routed to local proxy, then to NVIDIA NIM.',
+    '# Codex UI shows whatever model it picks (e.g. gpt-5.6-sol) - the proxy',
+    '# overrides it invisibly with the configured backend NIM model.',
+    'model_provider = "nvidia-nim"',
+    '',
+    '[model_providers.nvidia-nim]',
+    'name = "NVIDIA NIM"',
+    'base_url = "http://localhost:8765/v1"',
+    'env_key = "NVIDIA_API_KEY"',
+    'wire_api = "responses"',
+    'requires_openai_auth = false',
+    'supports_websockets = false',
+    ''
+)
+$config = $configLines -join "`r`n"
+[System.IO.File]::WriteAllText("$codexDir\config.toml", $config, [System.Text.Encoding]::ASCII)
 Write-Host "  Written to $codexDir\config.toml" -ForegroundColor Green
 
 # Step 6: Install codex CLI (if not already installed)
@@ -96,10 +98,10 @@ if (-not $codexCmd) {
 Write-Host "[7/7] Verifying..." -ForegroundColor Yellow
 Write-Host ""
 Write-Host "Config file contents:" -ForegroundColor Cyan
-cat "$codexDir\config.toml"
+Get-Content "$codexDir\config.toml"
 Write-Host ""
 Write-Host "API key:" -ForegroundColor Cyan
-echo $env:NVIDIA_API_KEY
+Write-Host "  $env:NVIDIA_API_KEY"
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Green
 Write-Host "  INSTALL COMPLETE" -ForegroundColor Green
@@ -120,7 +122,7 @@ Write-Host ""
 Write-Host "  2. Open a NEW PowerShell window and run:" -ForegroundColor White
 Write-Host "       codex" -ForegroundColor White
 Write-Host ""
-Write-Host "  The proxy will silently route all requests to $BackendModel" -ForegroundColor Gray
-Write-Host "  on NVIDIA NIM. Codex's UI will show gpt-5.6-sol (or whatever" -ForegroundColor Gray
-Write-Host "  you pick with /model) — completely invisible." -ForegroundColor Gray
+Write-Host "  The proxy silently routes all requests to $BackendModel" -ForegroundColor Gray
+Write-Host "  on NVIDIA NIM. Codex UI shows gpt-5.6-sol (or whatever" -ForegroundColor Gray
+Write-Host "  you pick with /model) - completely invisible." -ForegroundColor Gray
 Write-Host ""
