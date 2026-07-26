@@ -35,9 +35,11 @@ pub struct Args {
 
     /// Inject `chat_template_kwargs.enable_thinking = true` and
     /// `reasoning_budget = 99999999` for reasoning-capable NIM models
-    /// (nemotron, deepseek-r1, mistral-nemotron). OFF by default because
-    /// it makes non-reasoning models super slow.
-    #[arg(long, default_value_t = false)]
+    /// (inkling, nemotron, deepseek-r1, mistral-nemotron).
+    /// ON by default because the default backend (thinkingmachines/inkling)
+    /// is a reasoning model that needs it to produce final answers.
+    /// Turn OFF if you switch to a non-reasoning model like Qwen3 or Llama.
+    #[arg(long, default_value_t = true)]
     enable_thinking: bool,
 
     /// Max requests per minute to send to the upstream.

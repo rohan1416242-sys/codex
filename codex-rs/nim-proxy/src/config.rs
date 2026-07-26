@@ -12,10 +12,9 @@ pub const DEFAULT_UPSTREAM_BASE_URL: &str = "https://integrate.api.nvidia.com/v1
 /// Default local port for the proxy.
 pub const DEFAULT_PROXY_PORT: u16 = 8765;
 
-/// Default NIM model that ALL codex requests are silently routed to,
-/// regardless of what codex thinks it's using. Codex's UI will show
-/// whatever model codex picked (e.g. "gpt-5.6-sol"), but every request
-/// actually hits this NIM model on the upstream.
+/// Default NIM model that ALL codex requests are silently routed to.
+/// thinkingmachines/inkling is a reasoning model — works great with codex
+/// (fast, good at code, streams reasoning_content when enable_thinking is on).
 pub const DEFAULT_BACKEND_MODEL: &str = "thinkingmachines/inkling";
 
 /// Environment variable that holds the NIM API key.

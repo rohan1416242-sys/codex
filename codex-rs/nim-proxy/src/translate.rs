@@ -133,14 +133,14 @@ pub fn translate_request(
     // Only inject thinking params when explicitly enabled. These unlock
     // `reasoning_content` on Nemotron / DeepSeek-R1 / Mistral-Nemotron /
     // Inkling, but they make non-reasoning models super slow if sent.
+    // NOTE: Only `chat_template_kwargs.enable_thinking` is universally
+    // supported. `reasoning_budget` is rejected by some models (e.g.
+    // thinkingmachines/inkling returns 400 "Unsupported parameter"), so
+    // we don't send it — NIM will use the model's default reasoning budget.
     if enable_thinking {
         let mut ctk = Map::new();
         ctk.insert("enable_thinking".to_string(), Value::Bool(true));
         chat_body.insert("chat_template_kwargs".to_string(), Value::Object(ctk));
-        chat_body.insert(
-            "reasoning_budget".to_string(),
-            Value::Number(serde_json::Number::from(99_999_999)),
-        );
     }
 
     // NOTE: We intentionally DO NOT forward these codex-specific fields
@@ -148,6 +148,24 @@ pub fn translate_request(
     //   - store, stream_options, include, service_tier, prompt_cache_key
     //   - text, client_metadata, previous_response_id, reasoning
     // Codex doesn't need them to be honored — they're optimizations.
+
+    // ─── drop_params: NIM validation fixes (like LiteLLM's drop_params) ───
+    // NIM returns 400 "When using tool_choice, tools must be set" if codex
+    // sends tool_choice without tools (which happens on simple "hi" turns
+    // where no tools are needed). Drop tool_choice in that case.
+    let has_tools = chat_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|t| !t.is_empty());
+    if !has_tools {
+        chat_body.remove("tool_choice");
+        // parallel_tool_calls without tools is also rejected by some models.
+        chat_body.remove("parallel_tool_calls");
+    }
+
+    // Some NIM models reject `web_search_options` (codex sends it for
+    // models that advertise web search). Drop it — NIM doesn't support it.
+    chat_body.remove("web_search_options");
 
     Ok((Value::Object(chat_body), incoming_model))
 }
@@ -955,7 +973,9 @@ mod tests {
         // (this is what makes the bridge INVISIBLE).
         assert_eq!(incoming, "gpt-5.6-sol");
         assert_eq!(chat["stream"], true);
-        assert_eq!(chat["tool_choice"], "auto");
+        // tool_choice is DROPPED because no tools are present in this request
+        // (NIM rejects tool_choice without tools with a 400).
+        assert!(chat.get("tool_choice").is_none());
     }
 
     #[test]
@@ -1020,7 +1040,9 @@ mod tests {
         let body = serde_json::json!({"model": "x", "input": "hi"});
         let (chat, _) = translate_request(&body, "nemotron", true).unwrap();
         assert_eq!(chat["chat_template_kwargs"]["enable_thinking"], true);
-        assert_eq!(chat["reasoning_budget"], 99_999_999);
+        // Note: reasoning_budget is NOT sent because some models (inkling)
+        // reject it with 400 "Unsupported parameter".
+        assert!(chat.get("reasoning_budget").is_none());
     }
 
     #[test]
@@ -1100,6 +1122,48 @@ mod tests {
         // Text-only content should be a plain string (joined), not an array.
         assert!(messages[0]["content"].is_string());
         assert_eq!(messages[0]["content"], "hello\nworld");
+    }
+
+    #[test]
+    fn drops_tool_choice_when_no_tools() {
+        // Codex sends tool_choice="auto" even on simple "hi" turns where no
+        // tools are needed. NIM rejects this with 400. We must drop it.
+        let body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": "hi",
+            "tool_choice": "auto",
+            "parallel_tool_calls": false
+        });
+        let (chat, _) = translate_request(&body, "inkling", false).unwrap();
+        assert!(chat.get("tool_choice").is_none(), "tool_choice must be dropped when no tools");
+        assert!(chat.get("parallel_tool_calls").is_none(), "parallel_tool_calls must be dropped when no tools");
+    }
+
+    #[test]
+    fn keeps_tool_choice_when_tools_present() {
+        let body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": "list files",
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "tools": [
+                {"type": "function", "name": "shell", "parameters": {"type": "object"}, "description": "Run a shell command"}
+            ]
+        });
+        let (chat, _) = translate_request(&body, "inkling", false).unwrap();
+        assert_eq!(chat["tool_choice"], "auto");
+        assert_eq!(chat["parallel_tool_calls"], true);
+    }
+
+    #[test]
+    fn drops_web_search_options() {
+        let body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": "hi",
+            "web_search_options": {"search_context_size": "medium"}
+        });
+        let (chat, _) = translate_request(&body, "inkling", false).unwrap();
+        assert!(chat.get("web_search_options").is_none());
     }
 
     #[test]
